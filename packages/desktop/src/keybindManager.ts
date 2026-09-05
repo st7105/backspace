@@ -1,5 +1,7 @@
 import type { UiohookKeyboardEvent, UiohookMouseEvent } from 'uiohook-napi';
-import { BrowserWindow, systemPreferences } from 'electron';
+import { app, BrowserWindow, systemPreferences } from 'electron';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { GlobalShortcutsPortal } from './globalShortcutsPortal';
 import { isWayland, PortalKeybindStatus } from './portalShortcut';
 
@@ -79,27 +81,37 @@ export class KeybindManager {
   private started = false;
   private hook?: typeof import('uiohook-napi').uIOhook;
   private portal?: GlobalShortcutsPortal;
+  private portalRegistered = false;
   private portalStatus: PortalKeybindStatus | null = isWayland() ? { state: 'idle', shortcuts: {} } : null;
 
   getPortalStatus(): PortalKeybindStatus | null { return this.portalStatus; }
 
   retryPortal(): void {
-    if (this.portalStatus && ['idle', 'unavailable'].includes(this.portalStatus.state)) this.startPortal(true);
+    if (this.portalStatus && ['idle', 'unavailable'].includes(this.portalStatus.state)) this.startPortal();
   }
 
   refreshPortal(): void { void this.portal?.refresh(); }
 
   private sendPortalStatus = (status: PortalKeybindStatus): void => {
+    if (status.state === 'ready' && !this.portalRegistered) {
+      try {
+        // Only remember opt-in; the desktop remains responsible for assignments.
+        writeFileSync(join(app.getPath('userData'), 'global-shortcuts.json'), JSON.stringify({ registered: true }));
+        this.portalRegistered = true;
+      } catch (error) {
+        console.warn('[KeybindManager] Could not persist portal registration:', error);
+      }
+    }
     this.portalStatus = status;
     if (this.window && !this.window.isDestroyed()) this.window.webContents.send('keybind-portal-status', status);
   };
 
-  private startPortal(interactive = false): void {
+  private startPortal(): void {
     this.portal?.stop();
     this.portal = undefined;
     this.sendPortalStatus({ state: 'pending', shortcuts: {} });
     this.portal = new GlobalShortcutsPortal((id, pressed) => this.sendAction(id, pressed), this.sendPortalStatus);
-    void this.portal.start(interactive);
+    void this.portal.start();
   }
 
   constructor() {
@@ -112,7 +124,16 @@ export class KeybindManager {
   setWindow(win: BrowserWindow): void {
     this.window = win;
     if (this.portalStatus) {
-      if (!this.portal) this.startPortal();
+      if (!this.portal) {
+        try {
+          this.portalRegistered = JSON.parse(readFileSync(
+            join(app.getPath('userData'), 'global-shortcuts.json'), 'utf8',
+          ))?.registered === true;
+        } catch { this.portalRegistered = false; }
+        // First launch stays idle until Keybinds settings requests registration.
+        // Once registered, always create AND bind a new session on relaunch.
+        if (this.portalRegistered) this.startPortal();
+      }
       win.on('focus', () => this.refreshPortal());
     }
   }

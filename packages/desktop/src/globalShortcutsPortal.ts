@@ -36,7 +36,8 @@ export class GlobalShortcutsPortal {
     private readonly createBus: () => MessageBus = sessionBus,
   ) {}
 
-  async start(interactive = false): Promise<void> {
+  /** Create and bind a fresh session on every app launch. */
+  async start(): Promise<void> {
     if (this.closed || this.bus) return;
     this.status({ state: 'pending', shortcuts: {} });
     try {
@@ -80,13 +81,8 @@ export class GlobalShortcutsPortal {
         throw new Error('Portal returned an invalid session handle');
       }
       this.session = session;
-      const previous = await this.listShortcuts();
-      // Do not prompt on a first app launch. Opening Keybinds explicitly opts in.
-      // On subsequent launches restore the registered actions even with no local bindings.
-      if (!interactive && (!Array.isArray(previous) || !previous.length)) {
-        this.status({ state: 'idle', shortcuts: {} });
-        return;
-      }
+      // Bind every new session so the backend can restore its saved assignments.
+      // An empty pre-bind ListShortcuts result must not prevent registration.
       const shortcuts: Shortcut[] = Object.entries(ACTIONS).map(([id, description]) =>
         [id, { description: new Variant('s', description) }]);
       const bound = await this.request('BindShortcuts', 'oa(sa{sv})sa{sv}',
@@ -98,7 +94,7 @@ export class GlobalShortcutsPortal {
     }
   }
 
-  private async listShortcuts(): Promise<unknown> {
+  private async listShortcuts(): Promise<unknown[]> {
     const result = await this.request('ListShortcuts', 'oa{sv}',
       (token) => [this.session, { handle_token: new Variant('s', token) }]);
     if (!Array.isArray(result.shortcuts?.value)) throw new Error('Portal returned invalid shortcuts');

@@ -907,11 +907,14 @@ no additional bus permissions or unrestricted input-device access are requested.
 
 The desktop is the sole source of truth for Wayland assignments. The application
 registers a stable catalogue of all six voice actions, without preferred triggers
-or dependence on browser/X11 keybind storage. At startup, CreateSession followed
-by ListShortcuts discovers prior system registration; existing assignments are
-rebound for the new session. With no prior registration, startup remains idle and
-does not prompt. Opening Settings → Keybinds initiates registration of all actions.
-After cancellation, only the explicit retry button can request consent again.
+or dependence on browser/X11 keybind storage. After successful registration, every startup creates a session and
+calls BindShortcuts so the desktop can restore its saved assignments. Registration
+is not gated on ListShortcuts: some backends return an empty list before binding
+the new session. First launch stays idle until Settings → Keybinds requests registration.
+Successful registration is remembered in `userData/global-shortcuts.json`; only
+the registration flag is stored, never shortcut assignments. Existing installs
+without this flag need to open Keybinds once to save it.
+After cancellation or failure, the explicit retry button can register a new session.
 
 On Wayland the settings panel has no local recorder, edit or delete controls.
 It directs users to the system's Backspace shortcut settings and shows a read-only

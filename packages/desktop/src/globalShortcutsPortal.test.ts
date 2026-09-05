@@ -13,15 +13,18 @@ class FakeBus extends EventEmitter {
   disconnect = vi.fn();
   denied = false;
   suspended = false;
+  emptyBeforeBind = false;
+  bound = false;
   shortcuts = [['pushToTalk', { trigger_description: new Variant('s', 'Ctrl+V') }]];
   call = vi.fn(async (message: Message) => {
     if (message.member === 'GetNameOwner') return new Message({ type: MessageType.METHOD_RETURN, replySerial: '1', body: [':1.99'] });
     if (message.member === 'CreateSession' || message.member === 'BindShortcuts' || message.member === 'ListShortcuts') {
+      if (message.member === 'BindShortcuts') this.bound = true;
       const options = message.body.at(-1) as Record<string, Variant<string>>;
       const path = `${PATH}/request/1_2/${options.handle_token!.value}`;
       const result = message.member === 'CreateSession'
         ? { session_handle: new Variant('s', SESSION) }
-        : { shortcuts: new Variant('a(sa{sv})', this.shortcuts) };
+        : { shortcuts: new Variant('a(sa{sv})', this.emptyBeforeBind && !this.bound ? [] : this.shortcuts) };
       // Deliberately respond synchronously, BEFORE returning the method reply.
       if (!this.suspended) this.signal('org.freedesktop.portal.Request', 'Response', [this.denied ? 1 : 0, result], path);
       return new Message({ type: MessageType.METHOD_RETURN, replySerial: '1', body: [path] });
@@ -49,16 +52,29 @@ afterEach(() => {
 });
 
 describe('GlobalShortcuts portal lifecycle', () => {
+  it('registers at startup when the backend exposes saved assignments only after binding', async () => {
+    const { bus, client, status, action } = setup();
+    bus.emptyBeforeBind = true;
+    await client.start();
+    expect(bus.call.mock.calls.filter(([m]) => m.member === 'BindShortcuts')).toHaveLength(1);
+    expect(status).toHaveBeenLastCalledWith({ state: 'ready', shortcuts: { pushToTalk: 'Ctrl+V' } });
+    bus.signal(IFACE, 'Activated', [SESSION, 'pushToTalk']);
+    bus.signal(IFACE, 'Deactivated', [SESSION, 'pushToTalk']);
+    expect(action.mock.calls).toEqual([['pushToTalk', true], ['pushToTalk', false]]);
+  });
   it('restores system registration on restart without local bindings', async () => {
     const { bus, client, status } = setup();
     await client.start();
     const calls = bus.call.mock.calls.map(([m]) => m.member);
-    expect(calls.indexOf('ListShortcuts')).toBeLessThan(calls.indexOf('BindShortcuts'));
+    expect(calls).toContain('CreateSession');
+    expect(calls).toContain('BindShortcuts');
+    expect(calls.indexOf('CreateSession')).toBeLessThan(calls.indexOf('BindShortcuts'));
+    expect(calls).not.toContain('ListShortcuts');
     expect(status).toHaveBeenLastCalledWith({ state: 'ready', shortcuts: { pushToTalk: 'Ctrl+V' } });
   });
   it('refreshes the full list on partial system changes and on focus refresh', async () => {
     const { bus, client, status, action } = setup();
-    await client.start(true);
+    await client.start();
     bus.signal(IFACE, 'Activated', [SESSION, 'pushToTalk']);
     bus.shortcuts = [
       ['pushToTalk', { trigger_description: new Variant('s', 'F9') }],
@@ -76,7 +92,7 @@ describe('GlobalShortcuts portal lifecycle', () => {
   });
   it('registers identity, handles early responses, and reports the actual assigned trigger', async () => {
     const { bus, status, client } = setup();
-    await client.start(true);
+    await client.start();
     expect(bus.call.mock.calls[0]![0].member).toBe('Register');
     expect(status).toHaveBeenLastCalledWith({ state: 'ready', shortcuts: { pushToTalk: 'Ctrl+V' } });
     const bind = bus.call.mock.calls.find(([message]) => message.member === 'BindShortcuts')![0];
@@ -85,12 +101,12 @@ describe('GlobalShortcuts portal lifecycle', () => {
       'toggleMute', 'toggleDeafen', 'pushToTalk', 'toggleCamera', 'toggleScreenShare', 'disconnect',
     ]);
     for (const entry of bind.body[1]) expect(entry[1]).not.toHaveProperty('preferred_trigger');
-    await client.start(true);
+    await client.start();
     expect(bus.call.mock.calls.filter(([message]) => message.member === 'BindShortcuts')).toHaveLength(1);
   });
   it('handles hold/release, rejects foreign signals, and deduplicates repeated activation', async () => {
     const { bus, action, client } = setup();
-    await client.start(true);
+    await client.start();
     bus.signal(IFACE, 'Activated', [SESSION, 'pushToTalk'], PATH, ':1.666');
     bus.signal(IFACE, 'Activated', ['/other', 'pushToTalk']);
     bus.signal(IFACE, 'Activated', [SESSION, 'unknown']);
@@ -104,7 +120,7 @@ describe('GlobalShortcuts portal lifecycle', () => {
   it.each(['stop', 'closed', 'error', 'eof', 'restart', 'removed'])('releases held PTT on %s', async (reason) => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { bus, action, status, client } = setup();
-    await client.start(true);
+    await client.start();
     bus.signal(IFACE, 'Activated', [SESSION, 'pushToTalk']);
     if (reason === 'stop') client.stop();
     if (reason === 'closed') bus.signal('org.freedesktop.portal.Session', 'Closed', [], SESSION);
@@ -122,23 +138,25 @@ describe('GlobalShortcuts portal lifecycle', () => {
       expect(status).toHaveBeenLastCalledWith({ state: 'unavailable', shortcuts: {} });
     }
   });
-  it('keeps declined bindings out of the global set and does not prompt on first launch', async () => {
+  it('keeps declined bindings out of the global set', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { bus, status, client } = setup();
     bus.denied = true;
-    await client.start(true);
+    await client.start();
     expect(status).toHaveBeenLastCalledWith({ state: 'unavailable', shortcuts: {} });
     expect(bus.disconnect).toHaveBeenCalledOnce();
-    const other = setup();
-    other.bus.shortcuts = [];
-    await other.client.start();
-    expect(other.bus.call.mock.calls.some(([m]) => m.member === 'BindShortcuts')).toBe(false);
-    expect(other.status).toHaveBeenLastCalledWith({ state: 'idle', shortcuts: {} });
+  });
+  it('registers the action catalogue on first launch even without saved assignments', async () => {
+    const { bus, client, status } = setup();
+    bus.shortcuts = [];
+    await client.start();
+    expect(bus.call.mock.calls.filter(([m]) => m.member === 'BindShortcuts')).toHaveLength(1);
+    expect(status).toHaveBeenLastCalledWith({ state: 'ready', shortcuts: {} });
   });
   it('releases resources when stopped during a permission dialog', async () => {
     const { bus, client, status } = setup();
     bus.suspended = true;
-    const started = client.start(true);
+    const started = client.start();
     await vi.waitFor(() => expect(bus.call.mock.calls.some(([m]) => m.member === 'CreateSession')).toBe(true));
     client.stop();
     await started;
@@ -150,7 +168,7 @@ describe('GlobalShortcuts portal lifecycle', () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { bus, client, status } = setup();
     bus.call.mockImplementation(() => new Promise(() => {}));
-    const started = client.start(true);
+    const started = client.start();
     await vi.advanceTimersByTimeAsync(15_000);
     await started;
     expect(status).toHaveBeenLastCalledWith({ state: 'unavailable', shortcuts: {} });
@@ -159,7 +177,7 @@ describe('GlobalShortcuts portal lifecycle', () => {
   it('accepts older portals without the optional host Registry', async () => {
     const { bus, client, status } = setup();
     bus.call.mockRejectedValueOnce(new DBusError('org.freedesktop.DBus.Error.UnknownMethod', 'old portal'));
-    await client.start(true);
+    await client.start();
     expect(status).toHaveBeenLastCalledWith({ state: 'ready', shortcuts: { pushToTalk: 'Ctrl+V' } });
   });
 });
